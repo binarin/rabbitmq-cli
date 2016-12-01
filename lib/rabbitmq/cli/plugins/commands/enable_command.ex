@@ -80,11 +80,22 @@ defmodule RabbitMQ.CLI.Plugins.Commands.EnableCommand do
              {false, false} -> :online
            end
 
-    case PluginHelpers.set_enabled_plugins(MapSet.to_list(plugins_to_set), mode, node_name, opts) do
-      %{set: new_enabled} = result ->
-        enabled = new_enabled -- implicit
-        Map.put(result, :enabled, enabled);
-      other -> other
+    case PluginHelpers.set_enabled_plugins(MapSet.to_list(plugins_to_set), opts) do
+      {:ok, enabled_plugins} ->
+        {:ok, Stream.concat([["The following plugins have been enabled:",
+                              enabled_plugins,
+                              "Applying plugin configuration to #{node}..."],
+                             RabbitMQ.CLI.Core.Helpers.defer(
+                               fn() ->
+                                 case PluginHelpers.update_enabled_plugins(enabled_plugins, mode, node_name, opts) do
+                                   %{set: new_enabled} = result ->
+                                     enabled = new_enabled -- implicit
+                                     Map.put(result, :enabled, enabled);
+                                   other -> other
+                                 end
+                               end)])};
+      {:error, _} = err ->
+        err
     end
   end
 end
