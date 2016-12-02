@@ -16,7 +16,7 @@
 defmodule RabbitMQ.CLI.Ctl.Commands.NodeHealthCheckCommand do
   @behaviour RabbitMQ.CLI.CommandBehaviour
 
-  @default_timeout 70_000
+  @default_timeout 20_000
 
   def scopes(), do: [:ctl, :diagnostics]
 
@@ -29,10 +29,15 @@ defmodule RabbitMQ.CLI.Ctl.Commands.NodeHealthCheckCommand do
       :infinity -> @default_timeout;
       other     -> other
     end
-    {args, Map.merge(opts, %{timeout: timeout})}
+    minimal = case opts[:minimal] do
+      false -> false;
+      _     -> true
+    end
+    {args, Map.merge(opts, %{timeout: timeout, minimal: minimal})}
   end
 
-  def switches(), do: [timeout: :integer]
+  def switches(), do: [minimal: :boolean]
+  def aliases(), do: [m: :minimal]
 
   def usage, do: "node_health_check"
 
@@ -41,8 +46,31 @@ defmodule RabbitMQ.CLI.Ctl.Commands.NodeHealthCheckCommand do
      "Checking health of node #{node_name} ..."]
   end
 
-  def run([], %{node: node_name, timeout: timeout}) do
-    case :rabbit_misc.rpc_call(node_name, :rabbit_health_check, :node, [node_name, timeout]) do
+  def run([], %{node: node_name, timeout: timeout, minimal: minimal}) do
+    health_check_stream = :rabbit_health_check.health_checks()
+    |> Stream.transform(:ok,
+      fn
+      (check, :ok) ->
+        result = run_health_check(node_name, timeout, check)
+        {[{check, result}], result};
+      (_, err) ->
+        {:halt, err}
+      end)
+
+    case minimal do
+      true ->
+        ## Reduce a stream to :ok or error
+        Enum.reduce_while(health_check_stream, :ok,
+                          fn({_check, :ok}, :ok) -> {:cont, :ok};
+                            ({check, err}, :ok) -> {:halt, {check, err}}
+                          end);
+      false ->
+        {:stream, health_check_stream}
+    end
+  end
+
+  defp run_health_check(node, timeout, check) do
+    case :rabbit_health_check.node_health_check(node, timeout, check) do
       :ok                                      ->
         :ok
       true                                     ->
@@ -61,9 +89,49 @@ defmodule RabbitMQ.CLI.Ctl.Commands.NodeHealthCheckCommand do
   def output(:ok, _) do
     {:ok, "Health check passed"}
   end
-  def output({:healthcheck_failed, message}, _) do
+  def output({check, {:healthcheck_failed, message}}, _) do
     {:error, RabbitMQ.CLI.Core.ExitCodes.exit_software,
-     "Error: healthcheck failed. Message: #{message}"}
+     healthcheck_failed_message(check, message)}
+  end
+  def output({check, {:badrpc, :timeout}}, %{timeout: timeout}) do
+    {:error, RabbitMQ.CLI.Core.ExitCodes.exit_software,
+     timeout_message(check, timeout)}
+  end
+  def output({check, {:badrpc, :nodedown}}, _) do
+    {:error, RabbitMQ.CLI.Core.ExitCodes.exit_software,
+     node_down_message(check)}
+  end
+  def output({:stream, stream}, opts) do
+    {:stream,
+     Stream.map(stream,
+                fn({check, :ok}) ->
+                    {check, :ok};
+                  ({check, {:healthcheck_failed, message}}) ->
+                    {:error, healthcheck_failed_message(check, message)};
+                  ({check, {:badrpc, :timeout}}) ->
+                    {:error, timeout_message(check, opts[:timeout])}
+                  ({check, {:badrpc, :nodedown}}) ->
+                    {:error, node_down_message(check)}
+                  ({check, error}) ->
+                    {:error, generic_error_message(check, error)}
+                end)}
+  end
+  def output({check, error}, _opts) do
+    {:error, RabbitMQ.CLI.Core.ExitCodes.exit_software,
+     generic_error_message(check, error)}
   end
   use RabbitMQ.CLI.DefaultOutput
+
+  defp timeout_message(check, timeout) do
+    "Error: #{check} healthcheck timed out. Timeout: #{timeout}"
+  end
+  defp healthcheck_failed_message(check, message) do
+    "Error: #{check} healthcheck failed. Message: #{message}"
+  end
+  defp node_down_message(check) do
+    "Error: #{check} healthcheck failed. Node is not running"
+  end
+  defp generic_error_message(check, error) do
+    "Error: #{check} healthcheck failed. Error: #{inspect(error)}"
+  end
 end
